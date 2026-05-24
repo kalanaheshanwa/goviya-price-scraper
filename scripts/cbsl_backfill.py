@@ -11,7 +11,6 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 CBSL_LISTING = "https://www.cbsl.gov.lk/en/statistics/economic-indicators/price-report"
 HEADERS = {"User-Agent": "Mozilla/5.0 (GoviyaBot/1.0)"}
-START_YEAR, START_MONTH = 2020, 7
 
 CROP_MAP = {
     "beans":"Beans","carrot":"Carrot","cabbage":"Cabbage","tomato":"Tomato",
@@ -33,26 +32,42 @@ def get_existing_dates(db):
     result = db.table("prices").select("price_date").eq("source","CBSL").execute()
     return set(r["price_date"] for r in result.data)
 
-def scrape_pdf_urls_for_month(year, month):
-    url = f"{CBSL_LISTING}?field_date_value[value][year]={year}&field_date_value[value][month]={month}"
+def scrape_all_pdf_urls():
     pdf_map = {}
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        if r.status_code != 200:
-            return pdf_map
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "pricerpt/price_report_" in href and href.endswith(".pdf"):
-                fname = href.split("/")[-1]
-                m = re.search(r"price_report_(\d{8})", fname)
-                if m:
-                    d = m.group(1)
-                    date_str = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
-                    full_url = href if href.startswith("http") else f"https://www.cbsl.gov.lk{href}"
-                    pdf_map[date_str] = full_url
-    except Exception as e:
-        log.warning(f"Error scraping {year}-{month:02d}: {e}")
+    page = 0
+    while True:
+        url = f"{CBSL_LISTING}?page={page}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                log.warning(f"  Page {page} returned {r.status_code}, stopping")
+                break
+            soup = BeautifulSoup(r.text, "html.parser")
+            found_on_page = 0
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "pricerpt/price_report_" in href and href.endswith(".pdf"):
+                    fname = href.split("/")[-1]
+                    m = re.search(r"price_report_(\d{8})", fname)
+                    if m:
+                        d = m.group(1)
+                        date_str = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+                        full_url = href if href.startswith("http") else f"https://www.cbsl.gov.lk{href}"
+                        pdf_map[date_str] = full_url
+                        found_on_page += 1
+            log.info(f"  Page {page}: {found_on_page} PDFs (total so far: {len(pdf_map)})")
+            if found_on_page == 0:
+                log.info("  No PDFs found on page, stopping")
+                break
+            oldest = min(pdf_map.keys())
+            if oldest < "2020-07-28":
+                log.info(f"  Reached {oldest}, old enough — stopping pagination")
+                break
+            page += 1
+            time.sleep(0.3)
+        except Exception as e:
+            log.warning(f"  Page {page} error: {e}")
+            break
     return pdf_map
 
 def download_pdf(url):
@@ -148,41 +163,34 @@ def main():
     crops   = {c["name_en"].lower(): c["id"] for c in db.table("crops").select("id,name_en").execute().data}
     markets = {m["name_en"].lower(): m["id"] for m in db.table("markets").select("id,name_en").execute().data}
     log.info(f"Loaded {len(crops)} crops, {len(markets)} markets")
+
     existing = get_existing_dates(db)
     log.info(f"Skipping {len(existing)} dates already in DB")
 
-    today = date.today()
+    log.info("Scraping CBSL listing pages to build PDF URL map...")
+    all_pdfs = scrape_all_pdf_urls()
+    log.info(f"Total PDFs found on website: {len(all_pdfs)}")
+
+    needed = {d: u for d, u in all_pdfs.items() if d >= "2020-07-29" and d not in existing}
+    log.info(f"PDFs to download and parse: {len(needed)}")
+
     total_saved, total_pdfs = 0, 0
-    year, month = START_YEAR, START_MONTH
-
-    while (year, month) <= (today.year, today.month):
-        log.info(f"--- {year}-{month:02d} ---")
-        pdf_map = scrape_pdf_urls_for_month(year, month)
-        log.info(f"  Found {len(pdf_map)} PDFs")
-        for date_str, pdf_url in sorted(pdf_map.items()):
-            if date_str in existing:
-                continue
-            pdf = download_pdf(pdf_url)
-            if not pdf:
-                log.info(f"  {date_str} — download failed")
-                continue
-            records = parse_pdf(pdf, date_str, crops, markets)
-            if records:
-                saved = save(db, records)
-                total_saved += saved
-                total_pdfs  += 1
-                log.info(f"  ✅ {date_str} — {saved} prices (total: {total_saved})")
-            else:
-                log.info(f"  {date_str} — no prices parsed")
-            time.sleep(0.5)
-        if month == 12:
-            year += 1
-            month = 1
+    for date_str, pdf_url in sorted(needed.items()):
+        pdf = download_pdf(pdf_url)
+        if not pdf:
+            log.info(f"  {date_str} — download failed")
+            continue
+        records = parse_pdf(pdf, date_str, crops, markets)
+        if records:
+            saved = save(db, records)
+            total_saved += saved
+            total_pdfs  += 1
+            log.info(f"  ✅ {date_str} — {saved} prices (total: {total_saved})")
         else:
-            month += 1
-        time.sleep(1)
+            log.info(f"  {date_str} — no prices parsed")
+        time.sleep(0.5)
 
-    log.info(f"=== DONE === PDFs: {total_pdfs} | Prices saved: {total_saved}")
+    log.info(f"=== DONE === PDFs processed: {total_pdfs} | Prices saved: {total_saved}")
 
 if __name__ == "__main__":
     main()
