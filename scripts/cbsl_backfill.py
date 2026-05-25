@@ -92,61 +92,95 @@ def parse_pdf(content, price_date, crops, markets):
     records = []
     dambulla_id   = markets.get("dambulla dec")
     peliyagoda_id = markets.get("peliyagoda dec")
+
+    # X-coordinate ranges (PDF points) for the Wholesale price columns on page 2.
+    # The report layout is: Pettah WS | Dambulla WS | Pettah Retail | Dambulla Retail | Narahenpita
+    # Each market has Yesterday and Today sub-columns.
+    # pdfplumber.extract_table() merges all crop rows into a single cell, making
+    # row[2]/row[3] etc. always None. Instead we classify each price word by its
+    # x-coordinate, determined from the "Yesterday / Today" header positions.
+    _PEL_YDAY  = (140, 196)   # Pettah WS Yesterday  (header x ≈ 146)
+    _PEL_TODAY = (196, 239)   # Pettah WS Today       (header x ≈ 196)
+    _DAM_YDAY  = (239, 289)   # Dambulla WS Yesterday (header x ≈ 239)
+    _DAM_TODAY = (289, 335)   # Dambulla WS Today     (header x ≈ 289)
+
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page in pdf.pages:
+            # Reasons are in the descriptive text on page 1 (summary/chart page).
+            reasons = {}
+            for page in pdf.pages[:1]:
                 text = page.extract_text() or ""
-                reasons = {}
                 for m in re.finditer(
-                    r"(?:Price of )([A-Za-z ]+?)\s+(increased|declined|remained)[^.]*?(?:due to|owing to)([^.]+)\.",
+                    r"(?:Price of )([A-Za-z ]+?)\s+(increased|declined|remained)"
+                    r"[^.]*?(?:due to|owing to)([^.]+)\.",
                     text, re.IGNORECASE):
-                    reasons[m.group(1).strip().lower()] = f"Price {m.group(2)} due to {m.group(3).strip()}."
+                    reasons[m.group(1).strip().lower()] = (
+                        f"Price {m.group(2)} due to {m.group(3).strip()}."
+                    )
 
-                for table in (page.extract_tables() or []):
-                    for row in table:
-                        if not row or not row[0]:
-                            continue
-                        crop_raw = str(row[0]).strip()
-                        skip = ["item","unit","yesterday","today","wholesale","retail",
-                                "vegetable","fruit","other","rice","fish"]
-                        if any(w in crop_raw.lower() for w in skip) or len(crop_raw) < 2:
-                            continue
-                        mapped = CROP_MAP.get(crop_raw.lower())
-                        if not mapped:
-                            continue
-                        crop_id = crops.get(mapped.lower())
-                        if not crop_id:
-                            continue
+            # Price table is always on page 2 (index 1).
+            if len(pdf.pages) < 2:
+                return records
 
-                        reason = next((v for k,v in reasons.items() if k in crop_raw.lower()), None)
+            words = pdf.pages[1].extract_words()
 
-                        if peliyagoda_id and len(row) > 3:
-                            yday  = safe_float(row[2])
-                            today = safe_float(row[3])
-                            if today and today > 0:
-                                records.append({
-                                    "crop_id": crop_id, "market_id": peliyagoda_id,
-                                    "price_date": price_date,
-                                    "price_avg": today,
-                                    "price_min": min(today, yday) if yday else today,
-                                    "price_max": max(today, yday) if yday else today,
-                                    "price_yesterday": yday, "source": "CBSL",
-                                    "price_reason": reason,
-                                })
+            # Each "Rs./" token marks exactly one commodity row. Prices render
+            # ~0.7 pt below the text baseline in these PDFs; ±2 pt catches both.
+            for rs_word in (w for w in words if "Rs./" in w["text"]):
+                anchor_y = rs_word["top"]
+                row_words = sorted(
+                    [w for w in words if abs(w["top"] - anchor_y) <= 2.0],
+                    key=lambda w: w["x0"],
+                )
 
-                        if dambulla_id and len(row) > 5:
-                            yday  = safe_float(row[4])
-                            today = safe_float(row[5])
-                            if today and today > 0:
-                                records.append({
-                                    "crop_id": crop_id, "market_id": dambulla_id,
-                                    "price_date": price_date,
-                                    "price_avg": today,
-                                    "price_min": min(today, yday) if yday else today,
-                                    "price_max": max(today, yday) if yday else today,
-                                    "price_yesterday": yday, "source": "CBSL",
-                                    "price_reason": reason,
-                                })
+                name_parts = [w["text"] for w in row_words if w["x0"] < 95]
+                if not name_parts:
+                    continue
+                crop_raw = " ".join(name_parts).strip()
+
+                mapped = CROP_MAP.get(crop_raw.lower())
+                if not mapped:
+                    continue
+                crop_id = crops.get(mapped.lower())
+                if not crop_id:
+                    continue
+
+                reason = next((v for k, v in reasons.items() if k in crop_raw.lower()), None)
+
+                def get_price(x_min, x_max, rw=row_words):
+                    for w in rw:
+                        if x_min <= w["x0"] < x_max:
+                            return safe_float(w["text"])
+                    return None
+
+                if peliyagoda_id:
+                    yday  = get_price(*_PEL_YDAY)
+                    today = get_price(*_PEL_TODAY)
+                    if today and today > 0:
+                        records.append({
+                            "crop_id": crop_id, "market_id": peliyagoda_id,
+                            "price_date": price_date,
+                            "price_avg": today,
+                            "price_min": min(today, yday) if yday else today,
+                            "price_max": max(today, yday) if yday else today,
+                            "price_yesterday": yday, "source": "CBSL",
+                            "price_reason": reason,
+                        })
+
+                if dambulla_id:
+                    yday  = get_price(*_DAM_YDAY)
+                    today = get_price(*_DAM_TODAY)
+                    if today and today > 0:
+                        records.append({
+                            "crop_id": crop_id, "market_id": dambulla_id,
+                            "price_date": price_date,
+                            "price_avg": today,
+                            "price_min": min(today, yday) if yday else today,
+                            "price_max": max(today, yday) if yday else today,
+                            "price_yesterday": yday, "source": "CBSL",
+                            "price_reason": reason,
+                        })
+
     except Exception as e:
         log.error(f"Parse error: {e}")
     return records
