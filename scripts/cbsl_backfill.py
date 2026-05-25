@@ -26,6 +26,9 @@ CROP_MAP = {
     "thalapath":"Thalapath","balaya":"Balaya",
     "sugar (white)":"Sugar","egg (white)":"Eggs","coconut oil":"Coconut Oil",
     "red dhal":"Red Dhal","ginger":"Ginger","turmeric":"Turmeric","garlic":"Garlic",
+    "dhal (small)":"Red Dhal","dhal":"Red Dhal",
+    "katta":"Kelawalla","sprat":"Balaya",
+    "sugar":"Sugar","egg":"Eggs",
 }
 
 def get_existing_dates(db):
@@ -57,7 +60,7 @@ def scrape_all_pdf_urls():
                         found_on_page += 1
             log.info(f"  Page {page}: {found_on_page} PDFs (total so far: {len(pdf_map)})")
             if found_on_page == 0:
-                log.info("  No PDFs found on page, stopping")
+                log.info("  No PDFs on page, stopping")
                 break
             oldest = min(pdf_map.keys())
             if oldest < "2020-07-28":
@@ -79,19 +82,71 @@ def download_pdf(url):
         pass
     return None
 
+def safe_float(val):
+    try:
+        return float(str(val or "").replace(",","").strip())
+    except Exception:
+        return None
+
 def parse_pdf(content, price_date, crops, markets):
     records = []
     dambulla_id   = markets.get("dambulla dec")
     peliyagoda_id = markets.get("peliyagoda dec")
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                tables = page.extract_tables() or []
-                log.info(f"  PAGE {page_num}: {len(tables)} tables found")
-                for t_num, table in enumerate(tables):
-                    log.info(f"  TABLE {t_num}: {len(table)} rows")
-                    for row in table[:8]:
-                        log.info(f"  ROW: {row}")
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                reasons = {}
+                for m in re.finditer(
+                    r"(?:Price of )([A-Za-z ]+?)\s+(increased|declined|remained)[^.]*?(?:due to|owing to)([^.]+)\.",
+                    text, re.IGNORECASE):
+                    reasons[m.group(1).strip().lower()] = f"Price {m.group(2)} due to {m.group(3).strip()}."
+
+                for table in (page.extract_tables() or []):
+                    for row in table:
+                        if not row or not row[0]:
+                            continue
+                        crop_raw = str(row[0]).strip()
+                        skip = ["item","unit","yesterday","today","wholesale","retail",
+                                "vegetable","fruit","other","rice","fish"]
+                        if any(w in crop_raw.lower() for w in skip) or len(crop_raw) < 2:
+                            continue
+                        mapped = CROP_MAP.get(crop_raw.lower())
+                        if not mapped:
+                            continue
+                        crop_id = crops.get(mapped.lower())
+                        if not crop_id:
+                            continue
+
+                        reason = next((v for k,v in reasons.items() if k in crop_raw.lower()), None)
+
+                        if peliyagoda_id and len(row) > 3:
+                            yday  = safe_float(row[2])
+                            today = safe_float(row[3])
+                            if today and today > 0:
+                                records.append({
+                                    "crop_id": crop_id, "market_id": peliyagoda_id,
+                                    "price_date": price_date,
+                                    "price_avg": today,
+                                    "price_min": min(today, yday) if yday else today,
+                                    "price_max": max(today, yday) if yday else today,
+                                    "price_yesterday": yday, "source": "CBSL",
+                                    "price_reason": reason,
+                                })
+
+                        if dambulla_id and len(row) > 5:
+                            yday  = safe_float(row[4])
+                            today = safe_float(row[5])
+                            if today and today > 0:
+                                records.append({
+                                    "crop_id": crop_id, "market_id": dambulla_id,
+                                    "price_date": price_date,
+                                    "price_avg": today,
+                                    "price_min": min(today, yday) if yday else today,
+                                    "price_max": max(today, yday) if yday else today,
+                                    "price_yesterday": yday, "source": "CBSL",
+                                    "price_reason": reason,
+                                })
     except Exception as e:
         log.error(f"Parse error: {e}")
     return records
