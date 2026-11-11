@@ -23,6 +23,7 @@ OUT = ROOT / "data" / "cbsl"
 BASE = "https://www.cbsl.gov.lk/sites/default/files/cbslweb_documents/statistics/pricerpt/"
 NAMES = ["price_report_{d}_e.pdf", "price_report_{d}_e_0.pdf", "price_report_{d}e.pdf"]
 UA = {"User-Agent": "Mozilla/5.0 (compatible; GoviyaPriceBot/1.0)"}
+SEEN = {}  # kinds of non-PDF responses, printed in the log to explain failures
 
 # Which market each of the 5 column pairs means, per section of the report.
 COLS = {
@@ -126,6 +127,8 @@ def fetch(day):
         r = requests.get(url, headers=UA, timeout=60)
         if r.status_code == 200 and r.content[:4] == b"%PDF":
             return url, r.content
+        k = f"HTTP {r.status_code} {r.headers.get('content-type', '?')}"
+        SEEN[k] = SEEN.get(k, 0) + 1
     return None, None
 
 
@@ -161,6 +164,7 @@ def main():
         print(f"{day}: saved {len(data['items'])} items (report date {data['date']})")
         new += 1
     have = sorted(p.stem for p in OUT.glob("*.json"))
+    print(f"responses that were not a PDF: {SEEN}")
     print(f"new files: {new}, failed: {failed}, latest saved: {have[-1] if have else 'none'}")
     if failed or not have:
         return 1
