@@ -1,0 +1,70 @@
+name: Goviya Website Update
+
+# Checks for a new Central Bank price report, saves it, and republishes the website.
+on:
+  schedule:
+    - cron: '30 3 * * 1-6'   # 9:00 AM Sri Lanka time
+    - cron: '30 7 * * 1-5'   # 1:00 PM
+    - cron: '30 12 * * 1-5'  # 6:00 PM
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'How many days back to check for missing reports'
+        default: '10'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: goviya-site
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pdfplumber==0.11.4 requests==2.32.3
+
+      - name: Fetch new price reports
+        id: fetch
+        continue-on-error: true
+        run: |
+          DAYS="${{ github.event.inputs.days || '10' }}"
+          if [ ! -d data/cbsl ]; then DAYS=75; fi
+          DAYS=$DAYS python scripts/cbsl_fetch.py
+
+      - name: Save new prices to the repository
+        run: |
+          git config user.name "goviya-bot"
+          git config user.email "goviya-bot@users.noreply.github.com"
+          git add data || true
+          git diff --cached --quiet || (git commit -m "Daily prices update" && git push)
+
+      - name: Build website
+        run: python scripts/build_site.py
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Publish website
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Fail if a report could not be read
+        if: steps.fetch.outcome == 'failure'
+        run: |
+          echo "A price report could not be downloaded or read. See the 'Fetch new price reports' step."
+          exit 1
